@@ -1,0 +1,6 @@
+name,smiles,probes
+methylene,[*:1]C[*:2],hydrophobic
+ethylene,[*:1]CC[*:2],hydrophobic
+ether,[*:1]CO[*:2],hbond_acceptor
+amide,[*:1]C(=O)N[*:2],"hbond_donor,hbond_acceptor"
+phenylene,[*:1]c1ccc([*:2])cc1,"hydrophobic,aromatic"

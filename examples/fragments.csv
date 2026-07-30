@@ -1,0 +1,6 @@
+name,smiles,probes
+methyl,[*:1]C,hydrophobic
+hydroxyl,[*:1]O,"hbond_donor,hbond_acceptor"
+amine,[*:1]N,"hbond_donor,positive"
+carbonyl,[*:1]C=O,hbond_acceptor
+chloro,[*:1]Cl,hydrophobic
