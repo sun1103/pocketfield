@@ -133,6 +133,19 @@ Optional retrosynthesis validation can be run under `rxn-env`:
 --retro-rules /Users/mai/Software/fragenv/data/uspto.templates.classified.json.gz
 ```
 
+## Inspect Growth Outputs
+
+After `grow` or `design`, inspect sector chemistry, dummy assignments, fragment/linker matches, desolvation penalties, and candidate score summaries:
+
+```bash
+/opt/anaconda3/envs/crem/bin/python -m pocketfield.cli inspect \
+  --grow-dir out/pocket_001/grow \
+  --top 10 \
+  --json-out out/pocket_001/grow/inspection.json
+```
+
+This is read-only except for `--json-out`.
+
 Useful generation controls:
 
 ```bash

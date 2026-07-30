@@ -515,6 +515,29 @@ rejection diagnostics
 3D RDKit molecules with score properties
 ```
 
+## Inspect Reports
+
+Use `inspect` after `grow` or `design` to audit the deterministic ranking inputs and outputs without opening each JSON file manually:
+
+```bash
+/opt/anaconda3/envs/crem/bin/python -m pocketfield.cli inspect \
+  --grow-dir out/pocket/grow \
+  --top 10 \
+  --json-out out/pocket/grow/inspection.json
+```
+
+The report includes:
+
+```text
+top sectors with probe/depth/openness/desolvation coefficients
+dummy map -> assigned sectors
+top fragment matches per sector
+top linker matches per sector
+candidate count, rejection summary, and best candidates
+```
+
+The match rows expose both `vector_match_score` and `desolvation_penalty`, so you can see whether a fragment is ranked well because of probe/vector agreement or penalized for unsupported buried polarity.
+
 ## Filtering
 
 Important filters:

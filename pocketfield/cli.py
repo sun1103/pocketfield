@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -29,6 +30,8 @@ def main(argv: list[str] | None = None) -> int:
             design(args)
         elif args.command == "fragments":
             fragments(args)
+        elif args.command == "inspect":
+            inspect_outputs(args)
         else:
             parser.error("missing command")
     except Exception as exc:
@@ -221,6 +224,290 @@ def fragments(args: argparse.Namespace) -> None:
         print(f"{fragment.name}\t{fragment.smiles}\t{','.join(fragment.probes)}")
 
 
+def inspect_outputs(args: argparse.Namespace) -> None:
+    paths = _inspect_paths(args)
+    report = _build_inspection_report(paths=paths, top=args.top)
+    _print_inspection_report(report)
+    if args.json_out:
+        write_json(args.json_out, report)
+        print(f"Wrote {args.json_out}")
+
+
+def _inspect_paths(args: argparse.Namespace) -> dict[str, Path]:
+    base = Path(args.grow_dir) if args.grow_dir else None
+    paths = {
+        "sector_coefficients": Path(args.sector_coefficients)
+        if args.sector_coefficients
+        else (base / "sector_coefficients.json" if base else None),
+        "fragment_features": Path(args.fragment_features)
+        if args.fragment_features
+        else (base / "fragment_features.json" if base else None),
+        "linker_features": Path(args.linker_features)
+        if args.linker_features
+        else (base / "linker_features.json" if base else None),
+        "dummy_assignments": Path(args.dummy_assignments)
+        if args.dummy_assignments
+        else (base / "dummy_sector_assignments.json" if base else None),
+        "candidates": Path(args.candidates)
+        if args.candidates
+        else (base / "candidates.json" if base else None),
+    }
+    if paths["sector_coefficients"] is None:
+        raise ValueError("Provide --grow-dir or --sector-coefficients.")
+    return {key: value for key, value in paths.items() if value is not None}
+
+
+def _build_inspection_report(paths: dict[str, Path], top: int) -> dict[str, object]:
+    top = max(1, top)
+    sectors = _read_required_json(paths["sector_coefficients"])
+    fragments_payload = _read_optional_json(paths.get("fragment_features"))
+    linkers_payload = _read_optional_json(paths.get("linker_features"))
+    assignments_payload = _read_optional_json(paths.get("dummy_assignments"))
+    candidates_payload = _read_optional_json(paths.get("candidates"))
+
+    sector_items = list(sectors.get("items", []))
+    sector_items.sort(key=lambda item: float(item.get("score", 0.0)))
+    report: dict[str, object] = {
+        "schema": "pocketfield.inspection_report.v1",
+        "inputs": {key: str(path) for key, path in paths.items()},
+        "top": top,
+        "vector_keys": sectors.get("vector_keys", []),
+        "sector_count": len(sector_items),
+        "top_sectors": [_sector_summary(item) for item in sector_items[:top]],
+    }
+
+    if assignments_payload:
+        report["dummy_assignments"] = _assignment_summary(assignments_payload, top)
+    if fragments_payload:
+        report["top_fragment_matches"] = _top_matches_by_sector(
+            sectors=sector_items[:top],
+            features=list(fragments_payload.get("items", [])),
+            label_key="fragment_name",
+            top=top,
+        )
+    if linkers_payload:
+        report["top_linker_matches"] = _top_matches_by_sector(
+            sectors=sector_items[:top],
+            features=list(linkers_payload.get("items", [])),
+            label_key="linker_name",
+            top=top,
+        )
+    if candidates_payload:
+        report["candidate_summary"] = _candidate_summary(candidates_payload, top)
+    return report
+
+
+def _read_required_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        raise ValueError(f"Inspection input does not exist: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_optional_json(path: Path | None) -> dict[str, object] | None:
+    if path is None or not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _sector_summary(item: dict[str, object]) -> dict[str, object]:
+    features = item.get("features", {})
+    if not isinstance(features, dict):
+        features = {}
+    return {
+        "sector_id": item.get("sector_id"),
+        "score": item.get("score"),
+        "best_probe": item.get("best_probe"),
+        "depth": _round_float(features.get("depth")),
+        "steric_openness": _round_float(features.get("steric_openness")),
+        "polarity": _round_float(features.get("polarity")),
+        "water_displacement": _round_float(features.get("water_displacement")),
+        "buried_polar_support": _round_float(features.get("buried_polar_support")),
+        "desolvation_risk": _round_float(features.get("desolvation_risk")),
+    }
+
+
+def _assignment_summary(payload: dict[str, object], top: int) -> list[dict[str, object]]:
+    assignments = payload.get("assignments", [])
+    if not isinstance(assignments, list):
+        return []
+    summary = []
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            continue
+        sectors = assignment.get("sectors", [])
+        if not isinstance(sectors, list):
+            sectors = []
+        summary.append(
+            {
+                "anchor_map": assignment.get("anchor_map"),
+                "sector_count": len(sectors),
+                "sectors": sectors[:top],
+            }
+        )
+    return summary
+
+
+def _top_matches_by_sector(
+    sectors: list[dict[str, object]],
+    features: list[dict[str, object]],
+    label_key: str,
+    top: int,
+) -> list[dict[str, object]]:
+    results = []
+    for sector in sectors:
+        ranked = []
+        for feature in features:
+            match = _score_inspection_match(sector, feature)
+            ranked.append(
+                {
+                    label_key: feature.get("name"),
+                    "smiles": feature.get("smiles"),
+                    **match,
+                }
+            )
+        ranked.sort(key=lambda item: float(item["score"]))
+        results.append({"sector_id": sector.get("sector_id"), "matches": ranked[:top]})
+    return results
+
+
+def _score_inspection_match(
+    sector: dict[str, object],
+    feature: dict[str, object],
+) -> dict[str, float]:
+    sector_vector = np.asarray(sector.get("vector", []), dtype=np.float64)
+    candidate_vector = np.asarray(feature.get("vector", []), dtype=np.float64)
+    if sector_vector.shape != candidate_vector.shape:
+        raise ValueError("Sector and candidate vectors use incompatible dimensions.")
+    dot = float(np.dot(sector_vector, candidate_vector))
+    mismatch = float(np.linalg.norm(sector_vector - candidate_vector))
+    vector_match_score = -dot + 0.35 * mismatch
+    desolvation_penalty = _inspection_desolvation_penalty(
+        _dict_feature(sector),
+        _dict_feature(feature),
+    )
+    return {
+        "score": _round_float(vector_match_score + desolvation_penalty),
+        "vector_match_score": _round_float(vector_match_score),
+        "desolvation_penalty": _round_float(desolvation_penalty),
+        "dot": _round_float(dot),
+        "mismatch": _round_float(mismatch),
+    }
+
+
+def _inspection_desolvation_penalty(
+    sector_features: dict[str, object],
+    candidate_features: dict[str, object],
+) -> float:
+    sector_risk = float(sector_features.get("desolvation_risk", 0.0))
+    candidate_cost = float(candidate_features.get("polar_desolvation_cost", 0.0))
+    polar_support_match = min(
+        float(sector_features.get("buried_polar_support", 0.0)),
+        float(candidate_features.get("buried_polar_support", 0.0)),
+    )
+    return 0.55 * sector_risk * candidate_cost * (1.0 - polar_support_match)
+
+
+def _dict_feature(item: dict[str, object]) -> dict[str, object]:
+    features = item.get("features", {})
+    return features if isinstance(features, dict) else {}
+
+
+def _candidate_summary(payload: dict[str, object], top: int) -> dict[str, object]:
+    candidates = payload.get("candidates", [])
+    if not isinstance(candidates, list):
+        candidates = []
+    best = sorted(candidates, key=lambda item: float(item.get("score", 0.0)))[:top]
+    return {
+        "candidate_count": payload.get("candidate_count", len(candidates)),
+        "attempted_requests": payload.get("attempted_requests"),
+        "total_requests": payload.get("total_requests"),
+        "rejections": payload.get("rejections", {}),
+        "best_candidates": [
+            {
+                "rank": candidate.get("rank"),
+                "smiles": candidate.get("smiles"),
+                "mode": candidate.get("mode"),
+                "score": _round_float(candidate.get("score")),
+                "field_score": _round_float(candidate.get("field_score")),
+                "clash_score": _round_float(candidate.get("clash_score")),
+                "sector_match_score": _round_float(candidate.get("sector_match_score")),
+            }
+            for candidate in best
+            if isinstance(candidate, dict)
+        ],
+    }
+
+
+def _print_inspection_report(report: dict[str, object]) -> None:
+    print("PocketField Inspection")
+    print(f"Sectors: {report['sector_count']}  Top: {report['top']}")
+    print()
+    print("Top sectors")
+    for sector in report.get("top_sectors", []):
+        print(
+            "  sector={sector_id} score={score} probe={best_probe} depth={depth} "
+            "open={steric_openness} water={water_displacement} polar={buried_polar_support} "
+            "risk={desolvation_risk}".format(**sector)
+        )
+
+    assignments = report.get("dummy_assignments", [])
+    if assignments:
+        print()
+        print("Dummy assignments")
+        for assignment in assignments:
+            sector_ids = [
+                str(sector.get("sector_id"))
+                for sector in assignment["sectors"]
+                if isinstance(sector, dict)
+            ]
+            print(
+                f"  map={assignment['anchor_map']} sectors={assignment['sector_count']} "
+                f"top={','.join(sector_ids)}"
+            )
+
+    _print_matches("Top fragment matches", report.get("top_fragment_matches", []), "fragment_name")
+    _print_matches("Top linker matches", report.get("top_linker_matches", []), "linker_name")
+
+    candidate_summary = report.get("candidate_summary")
+    if isinstance(candidate_summary, dict):
+        print()
+        print(
+            "Candidates: {candidate_count}  Attempted: {attempted_requests}  "
+            "Requests: {total_requests}".format(**candidate_summary)
+        )
+        rejections = candidate_summary.get("rejections", {})
+        if rejections:
+            rejection_text = ", ".join(f"{key}={value}" for key, value in sorted(rejections.items()))
+            print(f"Rejections: {rejection_text}")
+        for candidate in candidate_summary.get("best_candidates", []):
+            print(
+                "  rank={rank} score={score} field={field_score} clash={clash_score} "
+                "match={sector_match_score} mode={mode} smiles={smiles}".format(**candidate)
+            )
+
+
+def _print_matches(title: str, groups: object, label_key: str) -> None:
+    if not groups:
+        return
+    print()
+    print(title)
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        print(f"  sector={group.get('sector_id')}")
+        for match in group.get("matches", []):
+            print(
+                "    {label} score={score} vec={vector_match_score} desolv={desolvation_penalty} "
+                "smiles={smiles}".format(label=match.get(label_key), **match)
+            )
+
+
+def _round_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), 4)
+
+
 def _resolve_center(args: argparse.Namespace) -> np.ndarray:
     if args.center and args.ligand:
         raise ValueError("Use either --center or --ligand, not both.")
@@ -255,6 +542,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fragment-library",
         help="Optional .json, .jsonl, or .csv fragment library. Only smiles is required.",
     )
+
+    inspect_parser = subparsers.add_parser("inspect", help="inspect growth outputs and rankings")
+    inspect_parser.add_argument(
+        "--grow-dir",
+        help="Growth output directory containing sector/features/candidates JSON files.",
+    )
+    inspect_parser.add_argument(
+        "--sector-coefficients",
+        help="Explicit path to sector_coefficients.json. Required if --grow-dir is not provided.",
+    )
+    inspect_parser.add_argument("--fragment-features", help="Explicit path to fragment_features.json.")
+    inspect_parser.add_argument("--linker-features", help="Explicit path to linker_features.json.")
+    inspect_parser.add_argument(
+        "--dummy-assignments",
+        help="Explicit path to dummy_sector_assignments.json.",
+    )
+    inspect_parser.add_argument("--candidates", help="Explicit path to candidates.json.")
+    inspect_parser.add_argument("--top", type=int, default=5, help="Number of rows per section.")
+    inspect_parser.add_argument("--json-out", help="Optional path to write inspection report JSON.")
     return parser
 
 

@@ -118,6 +118,25 @@ class PocketFieldSmokeTest(unittest.TestCase):
             self.assertIn("water_displacement", fragment_features["vector_keys"])
             self.assertIn("polar_desolvation_cost", fragment_features["items"][0]["features"])
 
+            inspect_rc = main(
+                [
+                    "inspect",
+                    "--grow-dir",
+                    str(grow_dir),
+                    "--top",
+                    "2",
+                    "--json-out",
+                    str(grow_dir / "inspection.json"),
+                ]
+            )
+            self.assertEqual(inspect_rc, 0)
+            inspection = json.loads((grow_dir / "inspection.json").read_text())
+            self.assertEqual(inspection["schema"], "pocketfield.inspection_report.v1")
+            self.assertEqual(len(inspection["top_sectors"]), 2)
+            self.assertIn("top_fragment_matches", inspection)
+            self.assertIn("top_linker_matches", inspection)
+            self.assertIn("candidate_summary", inspection)
+
     def test_design_accepts_custom_fragment_library_when_rdkit_available(self) -> None:
         try:
             import rdkit  # noqa: F401
