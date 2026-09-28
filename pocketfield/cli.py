@@ -139,6 +139,7 @@ def grow(args: argparse.Namespace) -> None:
         out_dir=args.out_dir,
         anchor_smiles=args.anchor_smiles,
         anchor_structure=args.anchor_structure,
+        reference_ligand=args.reference_ligand,
         sectors_per_dummy=args.sectors_per_dummy,
         dummy_angle_cutoff=args.dummy_angle_cutoff,
         connect_anchor_dummies=args.bridge_anchor_dummies,
@@ -159,6 +160,8 @@ def grow(args: argparse.Namespace) -> None:
         retro_rules=args.retro_rules,
         retro_script=args.retro_script,
         random_seed=args.random_seed,
+        mode=args.mode,
+        cross_attention_weight=args.cross_attention_weight,
     )
     out_dir = Path(args.out_dir)
     print(f"Wrote {out_dir / 'candidates.sdf'}")
@@ -195,6 +198,7 @@ def design(args: argparse.Namespace) -> None:
             out_dir=str(grow_dir),
             anchor_smiles=args.anchor_smiles,
             anchor_structure=args.anchor_structure,
+            reference_ligand=args.reference_ligand,
             sectors_per_dummy=args.sectors_per_dummy,
             dummy_angle_cutoff=args.dummy_angle_cutoff,
             bridge_anchor_dummies=args.bridge_anchor_dummies,
@@ -215,6 +219,8 @@ def design(args: argparse.Namespace) -> None:
             retro_rules=args.retro_rules,
             retro_script=args.retro_script,
             random_seed=args.random_seed,
+            mode=args.mode,
+            cross_attention_weight=args.cross_attention_weight,
         )
     )
 
@@ -623,6 +629,15 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         ),
     )
     parser.add_argument(
+        "--reference-ligand",
+        help=(
+            "Optional 3D reference ligand (SDF/MOL/PDB) whose heavy-atom occupancy defines "
+            "the sectors screened for fragment matching. When --anchor-structure is also given, "
+            "anchor-occupied sectors are excluded, leaving the sectors the non-anchor part "
+            "(the grown arm) occupies. Writes reference_screening.json."
+        ),
+    )
+    parser.add_argument(
         "--sectors-per-dummy",
         type=int,
         default=4,
@@ -639,6 +654,12 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Connect pairs of anchor dummy sites through one linker fragment instead of decorating sites independently.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["fragment", "bridge", "auto"],
+        default="auto",
+        help="Growth mode: fragment (single dummies), bridge (linkers between pairs), auto (use --bridge-anchor-dummies). Default: auto.",
     )
     parser.add_argument(
         "--linker-distance-tolerance",
@@ -667,7 +688,7 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
     parser.add_argument(
         "--growth-depth",
         type=int,
-        default=2,
+        default=1,
         help="Maximum number of anchor attachment points to fill from sectors.",
     )
     parser.add_argument(
@@ -699,20 +720,20 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
     parser.add_argument(
         "--max-clash-score",
         type=float,
-        default=10.0,
-        help="Reject candidates above this protein clash score.",
+        default=0.5,
+        help="Reject candidates above this normalised clash score [0-1].",
     )
     parser.add_argument(
         "--max-field-score",
         type=float,
-        default=100.0,
-        help="Reject candidates with field_score above this threshold. Lower is better.",
+        default=0.5,
+        help="Reject candidates with normalised field_score above this threshold [0-1].",
     )
     parser.add_argument(
         "--sector-match-weight",
         type=float,
-        default=10.0,
-        help="Weight for the sector-fragment dot-product score in final ranking.",
+        default=0.25,
+        help="Weight for the normalised sector-fragment score [0-1] in final ranking.",
     )
     parser.add_argument(
         "--retro-rules",
@@ -720,10 +741,20 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
     )
     parser.add_argument(
         "--retro-script",
-        default="/Users/mai/Software/fragenv/scripts/merge_utils.py",
-        help="Path to merge_utils.py containing RetrosynthesisValidator.",
+        default=None,
+        help="Path to merge_utils.py containing RetrosynthesisValidator. "
+        "Defaults to the bundled pocketfield/merge_utils.py.",
     )
     parser.add_argument("--random-seed", type=int, default=13, help="RDKit embedding seed.")
+    parser.add_argument(
+        "--cross-attention-weight",
+        type=float,
+        default=0.0,
+        help="λ ∈ [0,1] for multi-head cross-attention re-ranking. "
+        "0 = disabled (default). 0.25 = neighbour compatibility re-ranks "
+        "fragments within each sector (sparse top-k, charge-modulated, "
+        "confidence-gated, mean-centred). See the README 'Cross-attention re-ranking' section.",
+    )
 
 
 if __name__ == "__main__":

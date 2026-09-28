@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+.pytest_cache/
 
 build/
 dist/
@@ -8,3 +9,10 @@ dist/
 
 out/
 outputs/
+
+# Reference protein/field/grow data (large, supplied per-experiment)
+tests/6duk_*
+
+# Per-experiment test cases (large, not for distribution)
+test2/
+test3/

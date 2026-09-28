@@ -134,7 +134,7 @@ class PocketFieldSmokeTest(unittest.TestCase):
             self.assertEqual(inspection["schema"], "pocketfield.inspection_report.v1")
             self.assertEqual(len(inspection["top_sectors"]), 2)
             self.assertIn("top_fragment_matches", inspection)
-            self.assertIn("top_linker_matches", inspection)
+            self.assertNotIn("top_linker_matches", inspection)
             self.assertIn("candidate_summary", inspection)
 
     def test_design_accepts_custom_fragment_library_when_rdkit_available(self) -> None:
@@ -171,6 +171,10 @@ class PocketFieldSmokeTest(unittest.TestCase):
                     "3",
                     "--request-limit",
                     "80",
+                    "--max-clash-score",
+                    "1000",
+                    "--max-field-score",
+                    "10000",
                     "--fragment-library",
                     str(ROOT / "examples" / "fragments.csv"),
                 ]
@@ -212,6 +216,10 @@ class PocketFieldSmokeTest(unittest.TestCase):
                     "3",
                     "--fragments-per-sector",
                     "2",
+                    "--max-clash-score",
+                    "1000",
+                    "--max-field-score",
+                    "10000",
                     "--fragment-library",
                     str(ROOT / "examples" / "fragments_smiles_only.csv"),
                 ]
