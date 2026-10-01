@@ -162,6 +162,11 @@ def grow(args: argparse.Namespace) -> None:
         random_seed=args.random_seed,
         mode=args.mode,
         cross_attention_weight=args.cross_attention_weight,
+        conformers=args.conformers,
+        pose_refine=args.pose_refine,
+        pose_refine_iters=args.pose_refine_iters,
+        linker_fit_mode=args.linker_fit_mode,
+        diversity_threshold=args.diversity_threshold,
     )
     out_dir = Path(args.out_dir)
     print(f"Wrote {out_dir / 'candidates.sdf'}")
@@ -221,6 +226,11 @@ def design(args: argparse.Namespace) -> None:
             random_seed=args.random_seed,
             mode=args.mode,
             cross_attention_weight=args.cross_attention_weight,
+            conformers=args.conformers,
+            pose_refine=args.pose_refine,
+            pose_refine_iters=args.pose_refine_iters,
+            linker_fit_mode=args.linker_fit_mode,
+            diversity_threshold=args.diversity_threshold,
         )
     )
 
@@ -674,6 +684,12 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         help="Number of linker conformers sampled for bridge geometry prefiltering.",
     )
     parser.add_argument(
+        "--conformers",
+        type=int,
+        default=10,
+        help="Number of RDKit conformers generated per candidate for ensemble scoring.",
+    )
+    parser.add_argument(
         "--max-candidates", type=int, default=50, help="Maximum generated candidates."
     )
     parser.add_argument(
@@ -714,8 +730,18 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
     parser.add_argument(
         "--max-heavy-atoms",
         type=int,
-        default=45,
-        help="Reject candidates above this heavy atom count.",
+        default=None,
+        help="Optional hard cap on heavy atom count. Default: no hard cap (size is ranked via the soft penalty instead).",
+    )
+    parser.add_argument(
+        "--diversity-threshold",
+        type=float,
+        default=1.0,
+        help="Pre-step fragment-level ECFP4 diversity filter. A candidate is "
+        "dropped before 3D embedding when its grown fragment/linker pattern is "
+        "similar to an already-kept candidate at every anchor map (Tanimoto > "
+        "threshold). Same fragment on different dummies stays distinct. "
+        "1.0 = off (default); ~0.5 collapses simple chain-length analogs.",
     )
     parser.add_argument(
         "--max-clash-score",
@@ -746,6 +772,28 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         "Defaults to the bundled pocketfield/merge_utils.py.",
     )
     parser.add_argument("--random-seed", type=int, default=13, help="RDKit embedding seed.")
+    parser.add_argument(
+        "--pose-refine",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rigid-body (6-DOF) pose refinement against the pocket field/clash score. De-novo (no anchor structure) only.",
+    )
+    parser.add_argument(
+        "--pose-refine-iters",
+        type=int,
+        default=60,
+        help="Nelder-Mead iterations for --pose-refine.",
+    )
+    parser.add_argument(
+        "--linker-fit-mode",
+        choices=("rigid", "flexible"),
+        default="rigid",
+        help="Bridge-mode linker fitting. 'rigid' (default) pins both anchor "
+        "components and both linker attachment atoms to their docked "
+        "coordinates; 'flexible' pins only the first anchor component and lets "
+        "the second component plus linker close the gap, avoiding spurious "
+        "rejections when a linker's length does not exactly match the gap.",
+    )
     parser.add_argument(
         "--cross-attention-weight",
         type=float,

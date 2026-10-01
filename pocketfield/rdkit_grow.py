@@ -27,6 +27,7 @@ from pocketfield.io import write_json
 from pocketfield.assembly import (
     _align_candidate_to_field,
     _assemble_molecule,
+    _axis_angle,
     _count_bad_bonds,
     _strip_isotopes,
 )
@@ -49,6 +50,7 @@ from pocketfield.geometry import (
     _dummy_assignment_payload,
     _dummy_sector_assignments,
     _fit_to_anchor_pose,
+    _linker_anchor_mapping,
     _reference_occupied_sectors,
 )
 from pocketfield.growth import (
@@ -90,7 +92,7 @@ def grow_candidates(
     include_pairs: bool,
     fragment_library: str | Path | None,
     linker_library: str | Path | None,
-    max_heavy_atoms: int,
+    max_heavy_atoms: int | None,
     max_clash_score: float,
     max_field_score: float | None,
     sector_match_weight: float,
@@ -100,10 +102,17 @@ def grow_candidates(
     mode: str = "auto",
     cross_attention_weight: float = 0.0,
     reference_ligand: str | Path | None = None,
+    conformers: int = 10,
+    pose_refine: bool = False,
+    pose_refine_iters: int = 60,
+    linker_fit_mode: str = "rigid",
+    diversity_threshold: float = 1.0,
 ) -> dict[str, Any]:
     try:
         from rdkit import Chem, Geometry
         from rdkit.Chem import AllChem
+        from rdkit import DataStructs
+        from rdkit.Chem import rdFingerprintGenerator
     except ImportError as exc:
         raise RuntimeError(
             "RDKit is required for 'pocketfield grow'. Run in a Python environment that has "
@@ -265,7 +274,7 @@ def grow_candidates(
     anchor_pose = _anchor_pose(Chem, anchor_structure)
 
     # Restore linker span cache from disk so conformer sampling is skipped on reruns.
-    span_cache = _load_linker_span_cache(linker_library)
+    span_cache = _load_linker_span_cache(linker_library) if linker_library is not None else {}
     if span_cache:
         setattr(_sample_linker_spans, "_cache", span_cache)
 
@@ -294,6 +303,54 @@ def grow_candidates(
     candidates = []
     attempted = 0
     rejections: dict[str, int] = {}
+    accepted_patterns: list[dict[int, Any]] = []
+    fp_cache: dict[str, Any] = {}
+    linker_ends_cache: dict[str, tuple[Any, Any]] = {}
+    morgan_gen: Any | None = None
+
+    if diversity_threshold < 1.0:
+        # Pre-step diversity: sort requests by the cheap (pre-3D) sector-match
+        # score so the greedy max-min picker keeps the most promising member of
+        # each cluster, then filter near-duplicate *fragments* (not whole
+        # molecules — the anchor is constant and would swamp the similarity).
+        morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+
+        def _cheap_score(request: dict[str, Any]) -> float:
+            scores = [a["sector_fragment_score"] for a in request["attachments"]]
+            return float(np.mean(scores)) if scores else 0.0
+
+        def _linker_ends(smi: str) -> tuple[Any, Any]:
+            # Morgan ignores atom-map numbers, so to tell the two ends of an
+            # asymmetric linker apart we relabel one dummy with a collision-free
+            # marker element (Po, Z=84) and fingerprint the linker twice.
+            mol = Chem.MolFromSmiles(smi)
+
+            def _end(keep_map: int) -> Any:
+                rw = Chem.RWMol(mol)
+                for atom in rw.GetAtoms():
+                    if atom.GetAtomicNum() != 0:
+                        continue
+                    if atom.GetAtomMapNum() == keep_map:
+                        atom.SetAtomicNum(84)
+                    atom.SetAtomMapNum(0)
+                return morgan_gen.GetFingerprint(rw.GetMol())
+
+            return _end(1), _end(2)
+
+        def _duplicate(pattern: dict[int, Any], accepted: list[dict[int, Any]]) -> bool:
+            # A candidate duplicates an accepted one only when they fill the
+            # same anchor maps with similar fragments at every map.
+            for acc in accepted:
+                if set(acc) != set(pattern):
+                    continue
+                if all(
+                    DataStructs.TanimotoSimilarity(pattern[m], acc[m]) > diversity_threshold
+                    for m in pattern
+                ):
+                    return True
+            return False
+
+        requests = sorted(requests, key=_cheap_score)
 
     for request_index, request in enumerate(requests):
         attempted += 1
@@ -309,63 +366,135 @@ def grow_candidates(
                 continue
             mol = _strip_isotopes(Chem, mol)
             smiles = Chem.MolToSmiles(mol)
-            if mol.GetNumHeavyAtoms() > max_heavy_atoms:
+            if max_heavy_atoms is not None and mol.GetNumHeavyAtoms() > max_heavy_atoms:
                 _record_rejection(rejections, "too_many_heavy_atoms")
                 continue
+            if morgan_gen is not None:
+                pattern: dict[int, Any] = {}
+                linker_end_idx: dict[str, int] = {}
+                for a in request["attachments"]:
+                    m = a["map"]
+                    if "fragment" in a:
+                        smi = a["fragment"].smiles
+                        fp = fp_cache.get(smi)
+                        if fp is None:
+                            fp = morgan_gen.GetFingerprint(Chem.MolFromSmiles(smi))
+                            fp_cache[smi] = fp
+                        pattern[m] = fp
+                    else:
+                        smi = a["linker"].smiles
+                        ends = linker_ends_cache.get(smi)
+                        if ends is None:
+                            ends = _linker_ends(smi)
+                            linker_ends_cache[smi] = ends
+                        idx = linker_end_idx.get(smi, 0)
+                        pattern[m] = ends[idx]
+                        linker_end_idx[smi] = idx + 1
+                if _duplicate(pattern, accepted_patterns):
+                    _record_rejection(rejections, "duplicate_similar")
+                    continue
+                accepted_patterns.append(pattern)
 
             mol3d = Chem.AddHs(mol)
             if anchor_pose is not None:
-                coordMap, coordTranslation = _anchor_coord_map(Chem, mol3d, anchor_smiles, anchor_structure)
+                coordMap, coordTranslation = _anchor_coord_map(
+                    Chem, mol3d, anchor_smiles, anchor_structure, linker_fit_mode=linker_fit_mode,
+                )
             else:
                 coordMap = {}
                 coordTranslation = (0.0, 0.0, 0.0)
             use_coordmap = len(coordMap) >= 2
-            status = AllChem.EmbedMolecule(
-                mol3d,
-                coordMap=coordMap if use_coordmap else {},
-                randomSeed=random_seed + request_index,
-            )
-            if status != 0:
+            params = AllChem.ETKDGv3()
+            params.randomSeed = random_seed + request_index
+            params.pruneRmsThresh = -1.0
+            if use_coordmap:
+                params.SetCoordMap(coordMap)
+            conf_ids = AllChem.EmbedMultipleConfs(mol3d, max(1, conformers), params)
+            if not conf_ids:
                 _record_rejection(rejections, "embedding_failed")
                 continue
-            try:
-                AllChem.UFFOptimizeMolecule(mol3d, maxIters=200)
-            except Exception:
-                pass
-            # Translate from origin-centred back to SDF coordinate frame.
-            if len(coordMap) >= 2 and coordTranslation != (0.0, 0.0, 0.0):
-                cx, cy, cz = coordTranslation
-                conf = mol3d.GetConformer()
-                for i in range(mol3d.GetNumAtoms()):
-                    p = conf.GetAtomPosition(i)
-                    conf.SetAtomPosition(i, Geometry.Point3D(p.x + cx, p.y + cy, p.z + cz))
-            if _count_bad_bonds(mol3d) > max(3, mol.GetNumHeavyAtoms() // 10):
+            # Optimize each conformer, then translate from origin-centred back
+            # to the SDF coordinate frame.
+            cx, cy, cz = coordTranslation
+            for conf_id in list(conf_ids):
+                try:
+                    AllChem.UFFOptimizeMolecule(mol3d, confId=conf_id, maxIters=200)
+                except Exception:
+                    pass
+                if len(coordMap) >= 2 and coordTranslation != (0.0, 0.0, 0.0):
+                    conf = mol3d.GetConformer(conf_id)
+                    for i in range(mol3d.GetNumAtoms()):
+                        p = conf.GetAtomPosition(i)
+                        conf.SetAtomPosition(i, Geometry.Point3D(p.x + cx, p.y + cy, p.z + cz))
+
+            # Align and score every conformer; keep the best (lowest score).
+            best_conf_id = None
+            best_score = None
+            scored: list[float] = []
+            for conf_id in list(conf_ids):
+                if _count_bad_bonds(mol3d, conf_id=conf_id) > max(3, mol.GetNumHeavyAtoms() // 10):
+                    continue
+                if anchor_pose is not None:
+                    # Only run Kabsch when we did NOT already transfer coordinates
+                    # via coordMap+translation (which leaves the molecule correctly placed).
+                    if len(coordMap) < 2:
+                        _fit_to_anchor_pose(mol3d, anchor_pose, conf_id=conf_id)
+                else:
+                    _align_candidate_to_field(mol3d, center, request["direction"], conf_id=conf_id)
+                conf_score = _score_candidate(
+                    mol3d,
+                    center,
+                    shells,
+                    directions,
+                    energies,
+                    probe_names,
+                    pocket_atoms,
+                    field_mins,
+                    field_ranges,
+                    conf_id=conf_id,
+                )
+                scored.append(conf_score["score"])
+                if best_score is None or conf_score["score"] < best_score["score"]:
+                    best_conf_id = conf_id
+                    best_score = conf_score
+            if best_conf_id is None:
                 _record_rejection(rejections, "bad_bond_geometry")
                 continue
-            if anchor_pose is not None:
-                # Only run Kabsch when we did NOT already transfer coordinates
-                # via coordMap+translation (which leaves the molecule correctly placed).
-                if len(coordMap) < 2:
-                    _fit_to_anchor_pose(mol3d, anchor_pose)
-            else:
-                _align_candidate_to_field(mol3d, center, request["direction"])
-            score = _score_candidate(
-                mol3d,
-                center,
-                shells,
-                directions,
-                energies,
-                probe_names,
-                pocket_atoms,
-                field_mins,
-                field_ranges,
-            )
+            score = best_score
+            if pose_refine and anchor_pose is None:
+                _refine_pose(
+                    mol3d,
+                    center,
+                    shells,
+                    directions,
+                    energies,
+                    probe_names,
+                    pocket_atoms,
+                    field_mins,
+                    field_ranges,
+                    conf_id=best_conf_id,
+                    iters=pose_refine_iters,
+                )
+                score = _score_candidate(
+                    mol3d,
+                    center,
+                    shells,
+                    directions,
+                    energies,
+                    probe_names,
+                    pocket_atoms,
+                    field_mins,
+                    field_ranges,
+                    conf_id=best_conf_id,
+                )
             if score["clash_score"] > max_clash_score:
                 _record_rejection(rejections, "clash_filter")
                 continue
             if max_field_score is not None and score["field_score"] > max_field_score:
                 _record_rejection(rejections, "field_filter")
                 continue
+            linker_fit_rmsd = _linker_fit_rmsd(mol3d, anchor_pose, conf_id=best_conf_id)
+            _keep_single_conformer(Chem, mol3d, best_conf_id)
             sector_match_score = float(
                 np.mean([attachment["sector_fragment_score"] for attachment in request["attachments"]])
             )
@@ -387,7 +516,11 @@ def grow_candidates(
                 ],
                 "sector_ids": request["sector_ids"],
                 "dummy_sector_angles": request["dummy_sector_angles"],
-                "linker_geometry": request.get("linker_geometry"),
+                "linker_geometry": (
+                    {**request["linker_geometry"], "fit_rmsd": linker_fit_rmsd}
+                    if request.get("linker_geometry") is not None and linker_fit_rmsd is not None
+                    else request.get("linker_geometry")
+                ),
                 "sector_fragment_scores": [
                     attachment["sector_fragment_score"] for attachment in request["attachments"]
                 ],
@@ -401,6 +534,10 @@ def grow_candidates(
                 "raw_score": score["score"],
                 "score": final_score,
                 "heavy_atoms": mol.GetNumHeavyAtoms(),
+                "n_conformers": len(scored),
+                "score_mean": float(np.mean(scored)) if scored else 0.0,
+                "score_std": float(np.std(scored)) if scored else 0.0,
+                "best_conf_id": int(best_conf_id),
             }
             mol3d.SetProp("_Name", f"pocketfield_{len(candidates) + 1}")
             for key, value in candidate.items():
@@ -436,6 +573,7 @@ def grow_candidates(
         "rejections": rejections,
         "filters": {
             "max_heavy_atoms": max_heavy_atoms,
+            "diversity_threshold": diversity_threshold,
             "max_clash_score": max_clash_score,
             "max_field_score": max_field_score,
             "sector_match_weight": sector_match_weight,
@@ -470,7 +608,7 @@ def grow_candidates(
 
     # Persist linker span cache to disk for faster reruns.
     span_cache = getattr(_sample_linker_spans, "_cache", None)
-    if span_cache:
+    if linker_library is not None and span_cache:
         _save_linker_span_cache(linker_library, span_cache)
 
     return result
@@ -498,3 +636,136 @@ def _load_retro_validator(rules_path: str | Path | None, script_path: str | Path
             "Retrosynthesis validation requires an environment with rdchiral. "
             "Run in a Python environment that has rdchiral, or disable --retro-rules."
         ) from exc
+
+
+def _keep_single_conformer(Chem: Any, mol: Any, conf_id: int) -> None:
+    """Drop all conformers except *conf_id*, re-homed as conformer 0."""
+    conf = mol.GetConformer(conf_id)
+    positions = [conf.GetAtomPosition(i) for i in range(mol.GetNumAtoms())]
+    mol.RemoveAllConformers()
+    new_conf = Chem.Conformer(mol.GetNumAtoms())
+    new_conf.SetId(0)
+    for i, p in enumerate(positions):
+        new_conf.SetAtomPosition(i, p)
+    mol.AddConformer(new_conf, assignId=False)
+
+
+def _linker_fit_rmsd(mol: Any, anchor_pose: dict[str, Any] | None, conf_id: int = 0) -> float | None:
+    """RMSD (Å) of linker attachment atoms vs their target anchor dummy coords."""
+    if anchor_pose is None:
+        return None
+    dummy_coords = anchor_pose.get("dummy_coords", {})
+    if not dummy_coords:
+        return None
+    link_to_anchor = _linker_anchor_mapping(mol)
+    conf = mol.GetConformer(conf_id)
+    errs = []
+    for atom in mol.GetAtoms():
+        if atom.HasProp("pocketfield_linker_map") and atom.GetAtomicNum() > 1:
+            anchor_map = link_to_anchor.get(atom.GetIntProp("pocketfield_linker_map"))
+            if anchor_map is not None and anchor_map in dummy_coords:
+                p = conf.GetAtomPosition(atom.GetIdx())
+                target = dummy_coords[anchor_map]
+                errs.append(float(np.linalg.norm([p.x - target[0], p.y - target[1], p.z - target[2]])))
+    if not errs:
+        return None
+    return float(np.sqrt(np.mean(np.square(errs))))
+
+
+def _nelder_mead(
+    f: Any,
+    x0: np.ndarray,
+    step: np.ndarray,
+    max_iter: int,
+    alpha: float = 1.0,
+    gamma: float = 2.0,
+    rho: float = 0.5,
+    sigma: float = 0.5,
+) -> tuple[np.ndarray, float]:
+    """Deterministic Nelder-Mead simplex (NumPy-only, no scipy)."""
+    n = len(x0)
+    simplex = [np.asarray(x0, dtype=np.float64)]
+    for i in range(n):
+        p = np.asarray(x0, dtype=np.float64)
+        p[i] += step[i]
+        simplex.append(p)
+    fvals = [float(f(p)) for p in simplex]
+
+    for _ in range(max_iter):
+        order = sorted(range(n + 1), key=lambda i: fvals[i])
+        simplex = [simplex[i] for i in order]
+        fvals = [fvals[i] for i in order]
+
+        centroid = np.mean(simplex[:-1], axis=0)
+        xr = centroid + alpha * (centroid - simplex[-1])
+        fr = float(f(xr))
+
+        if fr < fvals[0]:
+            xe = centroid + gamma * (xr - centroid)
+            fe = float(f(xe))
+            if fe < fr:
+                simplex[-1], fvals[-1] = xe, fe
+            else:
+                simplex[-1], fvals[-1] = xr, fr
+        elif fr < fvals[-2]:
+            simplex[-1], fvals[-1] = xr, fr
+        else:
+            if fr < fvals[-1]:
+                simplex[-1], fvals[-1] = xr, fr
+            xc = centroid + rho * (simplex[-1] - centroid)
+            fc = float(f(xc))
+            if fc < fvals[-1]:
+                simplex[-1], fvals[-1] = xc, fc
+            else:
+                for i in range(1, n + 1):
+                    simplex[i] = simplex[0] + sigma * (simplex[i] - simplex[0])
+                    fvals[i] = float(f(simplex[i]))
+
+    best = int(np.argmin(fvals))
+    return simplex[best], fvals[best]
+
+
+def _refine_pose(
+    mol: Any,
+    center: np.ndarray,
+    shells: np.ndarray,
+    directions: np.ndarray,
+    energies: np.ndarray,
+    probe_names: list[str],
+    pocket_atoms: list[dict[str, Any]],
+    field_mins: np.ndarray,
+    field_ranges: np.ndarray,
+    conf_id: int = 0,
+    iters: int = 60,
+) -> None:
+    """Deterministic rigid-body (6-DOF) pose refinement for the de-novo case.
+
+    Minimises the PocketField score over translation + rotation (axis-angle),
+    seeded from the current conformer and left at the refined pose.
+    """
+    from rdkit import Geometry
+
+    conf = mol.GetConformer(conf_id)
+    base = np.asarray(
+        [list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())],
+        dtype=np.float64,
+    )
+    center0 = base.mean(axis=0)
+
+    def objective(x: np.ndarray) -> float:
+        tx, ty, tz, rx, ry, rz = x
+        t = np.array([tx, ty, tz], dtype=np.float64)
+        axis = np.array([rx, ry, rz], dtype=np.float64)
+        angle = float(np.linalg.norm(axis))
+        rot = _axis_angle(axis / angle, angle) if angle > 1e-8 else np.eye(3)
+        moved = (base - center0) @ rot.T + center0 + t
+        for i, xyz in enumerate(moved):
+            conf.SetAtomPosition(i, Geometry.Point3D(float(xyz[0]), float(xyz[1]), float(xyz[2])))
+        return _score_candidate(
+            mol, center, shells, directions, energies, probe_names,
+            pocket_atoms, field_mins, field_ranges, conf_id=conf_id,
+        )["score"]
+
+    step = np.array([1.0, 1.0, 1.0, 0.3, 0.3, 0.3], dtype=np.float64)
+    best_x, _ = _nelder_mead(objective, np.zeros(6), step, iters)
+    objective(best_x)  # leave the conformer at the refined pose

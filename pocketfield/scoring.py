@@ -48,6 +48,7 @@ def _score_candidate(
     field_mins: np.ndarray,
     field_ranges: np.ndarray,
     clash_cap: float = 3.0,
+    conf_id: int = 0,
 ) -> dict[str, float]:
     """Score a candidate molecule against the pocket field.
 
@@ -81,7 +82,7 @@ def _score_candidate(
         Per-heavy-atom clash Å² that saturates the clash score at 1.0.
     """
     BACKBONE_NAMES = {'N', 'CA', 'C', 'O', 'H', 'HA', 'OXT'}
-    conf = mol.GetConformer()
+    conf = mol.GetConformer(conf_id)
     probe_index = {name: index for index, name in enumerate(probe_names)}
     field_terms = []
     clash_score = 0.0  # backbone-weighted (full penalty)

@@ -69,6 +69,7 @@ def _anchor_coord_map(
     mol: Any,
     anchor_smiles: str,
     anchor_structure: str | Path | None,
+    linker_fit_mode: str = "rigid",
 ) -> tuple[dict[int, Any], tuple[float, float, float]]:
     """Build a coordMap for EmbedMolecule from the full anchor structure.
 
@@ -82,6 +83,12 @@ def _anchor_coord_map(
 
     Falls back to constraining only the two connection-point atoms (tagged
     with ``pocketfield_anchor_map``) when full substructure matching fails.
+
+    ``linker_fit_mode`` controls bridge-mode rigidity. ``"rigid"`` (default)
+    pins both anchor components and both linker attachment atoms to their
+    docked coordinates; ``"flexible"`` pins only the first anchor component
+    (the smallest anchor map) and its linker attachment, leaving the second
+    component and the rest of the linker free to close the gap.
     """
     from rdkit import Geometry
 
@@ -98,12 +105,27 @@ def _anchor_coord_map(
     anchor_conf = anchor_mol.GetConformer()
 
     coordMap: dict[int, Any] = {}
+    fixed_map: int | None = None
+    if linker_fit_mode == "flexible":
+        anchor_maps = _anchor_maps(Chem, anchor_smiles)
+        fixed_map = anchor_maps[0] if anchor_maps else None
 
     # ---- primary: full substructure matching ----
     for frag_smi in anchor_smiles.split("."):
         frag_mol = Chem.MolFromSmiles(frag_smi)
         if frag_mol is None:
             continue
+        if fixed_map is not None:
+            frag_map = next(
+                (
+                    atom.GetAtomMapNum() or atom.GetIsotope()
+                    for atom in frag_mol.GetAtoms()
+                    if atom.GetAtomicNum() == 0
+                ),
+                None,
+            )
+            if frag_map != fixed_map:
+                continue
         frag_no_dummy = Chem.RWMol(frag_mol)
         for idx in sorted(
             [a.GetIdx() for a in frag_no_dummy.GetAtoms() if a.GetAtomicNum() == 0],
@@ -128,7 +150,8 @@ def _anchor_coord_map(
     if len(coordMap) < 2:
         print(
             f"[pocketfield] Full substructure matching produced only {len(coordMap)} "
-            f"coordMap entries (expected ~49). Falling back to connection-point constraints."
+            f"coordMap entries (expected ~{anchor_mol.GetNumHeavyAtoms()}). "
+            f"Falling back to connection-point constraints."
         )
         sdf_neighbor_pos: dict[int, Geometry.Point3D] = {}
         for atom in anchor_mol.GetAtoms():
@@ -144,8 +167,32 @@ def _anchor_coord_map(
         for atom in mol.GetAtoms():
             if atom.HasProp("pocketfield_anchor_map") and atom.GetAtomicNum() > 1:
                 anchor_map = atom.GetIntProp("pocketfield_anchor_map")
+                if fixed_map is not None and anchor_map != fixed_map:
+                    continue
                 if anchor_map in sdf_neighbor_pos:
                     coordMap[atom.GetIdx()] = sdf_neighbor_pos[anchor_map]
+
+    # ---- linker attachment pins (bridge mode) ----
+    # Pin the linker's attachment atoms to the anchor dummy coordinates so the
+    # linker is geometrically closed between the fixed anchor points. In
+    # flexible mode only the first (fixed) end is pinned; the far end is left
+    # free so the linker can close the gap regardless of its exact length.
+    dummy_pos: dict[int, Geometry.Point3D] = {}
+    for atom in anchor_mol.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            anchor_map = atom.GetIsotope() or atom.GetAtomMapNum()
+            if anchor_map > 0:
+                pos = anchor_conf.GetAtomPosition(atom.GetIdx())
+                dummy_pos[anchor_map] = Geometry.Point3D(pos.x, pos.y, pos.z)
+    link_to_anchor = _linker_anchor_mapping(mol)
+    for atom in mol.GetAtoms():
+        if atom.HasProp("pocketfield_linker_map") and atom.GetAtomicNum() > 1:
+            linker_map = atom.GetIntProp("pocketfield_linker_map")
+            if fixed_map is not None and linker_map != 1:
+                continue
+            anchor_map = link_to_anchor.get(linker_map)
+            if anchor_map is not None and anchor_map in dummy_pos:
+                coordMap[atom.GetIdx()] = dummy_pos[anchor_map]
 
     # ---- centre coordinates at origin so RDKit distance geometry can use them ----
     if len(coordMap) >= 2:
@@ -160,11 +207,11 @@ def _anchor_coord_map(
     return coordMap, zero_translation
 
 
-def _fit_to_anchor_pose(mol: Any, anchor_pose: dict[str, Any]) -> None:
+def _fit_to_anchor_pose(mol: Any, anchor_pose: dict[str, Any], conf_id: int = 0) -> None:
     target = np.asarray(anchor_pose["heavy_coords"], dtype=np.float64)
     if target.size == 0:
         return
-    conf = mol.GetConformer()
+    conf = mol.GetConformer(conf_id)
     anchor_indices = [
         atom.GetIdx()
         for atom in mol.GetAtoms()
@@ -293,6 +340,27 @@ def _anchor_maps(Chem: Any, anchor_smiles: str) -> list[int]:
     if len(maps) != len(set(maps)):
         raise ValueError("Anchor dummy atom-map labels must be unique.")
     return maps
+
+
+def _linker_anchor_mapping(mol: Any) -> dict[int, int]:
+    """Map linker attachment atom-map (1/2) to the anchor dummy map it bonds to.
+
+    Reads the correspondence from the assembled molecule's topology (each linker
+    attachment atom, tagged ``pocketfield_linker_map``, is bonded to the anchor
+    connection atom tagged ``pocketfield_anchor_map``), so it holds for any
+    anchor dummy map labels and for 3+-dummy anchors alike.
+    """
+    mapping: dict[int, int] = {}
+    for atom in mol.GetAtoms():
+        if not (atom.HasProp("pocketfield_linker_map") and atom.GetAtomicNum() > 1):
+            continue
+        for neighbor in atom.GetNeighbors():
+            if neighbor.HasProp("pocketfield_anchor_map"):
+                mapping[atom.GetIntProp("pocketfield_linker_map")] = neighbor.GetIntProp(
+                    "pocketfield_anchor_map"
+                )
+                break
+    return mapping
 
 
 def _mean_direction(directions: list[list[float]]) -> np.ndarray:

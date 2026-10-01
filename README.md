@@ -165,13 +165,18 @@ Reports OBC-GBSA and (optionally) explicit TIP3P solvation energies for each mol
 --fragment-library examples/fragments.csv
 --growth-depth 3
 --request-limit 5000
---max-heavy-atoms 45
+--max-heavy-atoms 45   # optional hard cap; off by default (soft size penalty ranks)
+--diversity-threshold 0.5   # pre-step fragment-level ECFP4 diversity; 1.0 = off
 --max-clash-score 0.5
 --max-field-score 0.5
 --sector-match-weight 0.25
 --cross-attention-weight 0.25
 --linker-distance-tolerance 2.0
 --linker-conformers 20
+--linker-fit-mode rigid
+--conformers 10
+--pose-refine
+--pose-refine-iters 60
 ```
 
 ---
@@ -289,6 +294,8 @@ pocketfield design \
 ```
 
 In bridge mode PocketField uses true two-dummy linkers, bonds anchor site `[*:1]` to the linker `[*:1]` neighbor and `[*:2]` to the linker `[*:2]` neighbor, then removes all dummy atoms. Candidate records use `mode: bridge` and produce connected SMILES.
+
+When `--anchor-structure` is supplied, the two anchor components are held at their docked coordinates while the linker is fit between them. `--linker-fit-mode rigid` (default) pins both components and both linker attachment atoms, so a linker whose length does not exactly match the anchor gap is rejected at embedding. `--linker-fit-mode flexible` pins only the first anchor component and lets the second component plus the linker close the gap — this recovers linkers the rigid fit would reject, at the cost of moving one anchor component off its docked pose (recorded in the candidate's `linker_fit_rmsd`).
 
 ### Vector matching
 
@@ -414,7 +421,8 @@ out/pocket_001/
 Important filters:
 
 ```bash
---max-heavy-atoms 45
+--max-heavy-atoms 45   # optional; off by default — size is ranked via the soft penalty
+--diversity-threshold 0.5   # pre-step fragment-level ECFP4 diversity; 1.0 = off
 --max-clash-score 0.5
 --max-field-score 0.5
 ```
@@ -431,16 +439,18 @@ This uses `RetrosynthesisValidator` from the bundled `pocketfield/merge_utils.py
 
 Scores are normalised to `[0, 1]`, so to disable the field/clash filters set them to `1.0` (`--max-clash-score 1.0 --max-field-score 1.0`); for real pockets, keep them strict.
 
+### Diversity selection
+
+`--diversity-threshold` (default `1.0` = off) is a pre-step diversity filter in the spirit of STELLA's clustering-based selection: instead of spending 3D embedding on every enumerated candidate, PocketField computes an ECFP4 (radius 2) fingerprint on each *grown fragment/linker* (the variable substituent), not the whole molecule — the anchor is constant across candidates and would otherwise swamp the similarity signal. A candidate is dropped when its substituent *pattern* is similar to an already-kept candidate's at **every anchor map** (per-map Tanimoto > threshold); the same fragment on a different dummy stays distinct. This runs *before* `AddHs`/`EmbedMultipleConfs`/UFF, so the expensive 3D + scoring work is only paid for structurally diverse representatives. Requests are first sorted by their cheap sector-match score, so within each cluster the most promising member is the one that gets embedded. The cutoff is a max-Tanimoto on the substituent fingerprint — lower collapses more aggressively (e.g. `[*:1]CC` vs `[*:1]CCC` ≈ 0.56, while `[*:1]C` vs `[*:1]O` ≈ 0.2). A value around `0.5` collapses simple chain-length analogs but keeps distinct functional groups; `1.0` disables the filter. Tune it against the fragment library you want to treat as interchangeable.
+
 ---
 
 ## Current Scope
 
 PocketField builds the field, sector plan, and first-pass RDKit candidates with field/clash/vector scoring plus heuristic desolvation. It is not yet a production de novo design engine. Current limitations:
 
-- No docking refinement.
-- No conformer ensemble scoring.
+- No external docking (in-house rigid-body pose refinement is opt-in via `--pose-refine`).
 - Desolvation inside `grow` is a heuristic coefficient/penalty; explicit thermodynamics is only in the external `scripts/` solvation stage.
-- No torsion-aware linker fitting (bridge mode uses a coarse span prefilter).
 - Retrosynthesis validation is optional and does not replace a full synthetic-accessibility model.
 
 ---

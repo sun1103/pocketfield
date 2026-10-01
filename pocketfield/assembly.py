@@ -67,6 +67,8 @@ def _bridge_anchor_dummies(Chem: Any, base: Any, map_a: int, map_b: int, linker:
     rw.GetAtomWithIdx(base_neighbor_b).SetIntProp("pocketfield_anchor_map", int(map_b))
     rw.GetAtomWithIdx(offset + linker_neighbor_a).SetIsotope(99)
     rw.GetAtomWithIdx(offset + linker_neighbor_b).SetIsotope(99)
+    rw.GetAtomWithIdx(offset + linker_neighbor_a).SetIntProp("pocketfield_linker_map", 1)
+    rw.GetAtomWithIdx(offset + linker_neighbor_b).SetIntProp("pocketfield_linker_map", 2)
     remove_indices = sorted(
         [
             base_dummy_a.GetIdx(),
@@ -134,8 +136,8 @@ def _strip_isotopes(Chem: Any, mol: Any) -> Any:
     return clean
 
 
-def _align_candidate_to_field(mol: Any, center: np.ndarray, direction: np.ndarray) -> None:
-    conf = mol.GetConformer()
+def _align_candidate_to_field(mol: Any, center: np.ndarray, direction: np.ndarray, conf_id: int = 0) -> None:
+    conf = mol.GetConformer(conf_id)
     positions = np.array([list(conf.GetAtomPosition(i)) for i in range(mol.GetNumAtoms())])
     anchor_indices = [
         atom.GetIdx()
@@ -198,9 +200,9 @@ def _axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
     )
 
 
-def _count_bad_bonds(mol: Any, threshold: float = 2.5) -> int:
+def _count_bad_bonds(mol: Any, threshold: float = 2.5, conf_id: int = 0) -> int:
     """Return number of bonds whose length exceeds *threshold* (Angstrom)."""
-    conf = mol.GetConformer()
+    conf = mol.GetConformer(conf_id)
     bad = 0
     for bond in mol.GetBonds():
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()

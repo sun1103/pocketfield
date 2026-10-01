@@ -10,6 +10,9 @@ dist/
 out/
 outputs/
 
+# Linker span conformer caches (runtime artifacts)
+*.spans.json
+
 # Reference protein/field/grow data (large, supplied per-experiment)
 tests/6duk_*
 
