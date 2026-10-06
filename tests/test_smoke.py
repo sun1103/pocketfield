@@ -444,18 +444,18 @@ class PocketFieldSmokeTest(unittest.TestCase):
         except ImportError:
             self.skipTest("RDKit is not available in this Python environment.")
 
-        # Two disconnected one-heavy-atom anchors ([*:1]C.[*:2]C) 4.5 A apart
-        # with their dummies pointing toward each other, so the linker closes
-        # the gap between the fixed anchor points and its fit is measurable
+        # Two disconnected one-heavy-atom anchors ([*:1]C.[*:2]C) 2.5 A apart
+        # with their dummies pointing outward, so the linker closes the gap
+        # between the fixed anchor connection atoms and its fit is measurable
         # against the anchored dummy coordinates.
         anchor_sdf = (
             "  bridge_anchor\n"
             "     RDKit          3D\n\n"
             "  4  2  0  0  0  0  0  0  0  0999 V2000\n"
             "    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    1.5000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    4.5000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    3.0000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "   -1.2000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "    2.5000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
+            "    3.7000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
             "  1  2  1  0\n"
             "  3  4  1  0\n"
             "M  ISO  2   2   1   4   2\n"
@@ -531,98 +531,6 @@ class PocketFieldSmokeTest(unittest.TestCase):
             self.assertIsNotNone(linker_geometry)
             self.assertIn("fit_rmsd", linker_geometry)
             self.assertIsInstance(linker_geometry["fit_rmsd"], (int, float))
-
-    def test_bridge_mode_flexible_linker_fit_when_rdkit_available(self) -> None:
-        try:
-            import rdkit  # noqa: F401
-        except ImportError:
-            self.skipTest("RDKit is not available in this Python environment.")
-
-        # A 6 A anchor gap whose dummies point toward each other: short linkers
-        # cannot close it under the rigid fit, so the flexible fit (which lets
-        # the second component move) must recover them instead of rejecting them
-        # at embedding.
-        anchor_sdf = (
-            "  bridge_anchor\n"
-            "     RDKit          3D\n\n"
-            "  4  2  0  0  0  0  0  0  0  0999 V2000\n"
-            "    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    1.5000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    6.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "    4.5000    0.0000    0.0000 R   0  0  0  0  0  0  0  0  0  0  0  0\n"
-            "  1  2  1  0\n"
-            "  3  4  1  0\n"
-            "M  ISO  2   2   1   4   2\n"
-            "M  END\n"
-            "$$$$\n"
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            build_dir = Path(tmp) / "build"
-            grow_dir = Path(tmp) / "grow"
-            anchor_sdf_path = Path(tmp) / "bridge_anchor.sdf"
-            anchor_sdf_path.write_text(anchor_sdf)
-            self.assertEqual(
-                main(
-                    [
-                        "build",
-                        "--protein",
-                        str(ROOT / "examples" / "tiny_receptor.pdb"),
-                        "--ligand",
-                        str(ROOT / "examples" / "tiny_ligand.pdb"),
-                        "--out-dir",
-                        str(build_dir),
-                        "--samples",
-                        "64",
-                        "--sectors",
-                        "12",
-                        "--shells",
-                        "2.5,3.5",
-                        "--top-k",
-                        "4",
-                    ]
-                ),
-                0,
-            )
-            self.assertEqual(
-                main(
-                    [
-                        "grow",
-                        "--field",
-                        str(build_dir / "field.npz"),
-                        "--plan",
-                        str(build_dir / "growth_plan.json"),
-                        "--metadata",
-                        str(build_dir / "metadata.json"),
-                        "--out-dir",
-                        str(grow_dir),
-                        "--anchor-smiles",
-                        "[*:1]C.[*:2]C",
-                        "--anchor-structure",
-                        str(anchor_sdf_path),
-                        "--bridge-anchor-dummies",
-                        "--linker-library",
-                        str(ROOT / "examples" / "linkers.csv"),
-                        "--linker-fit-mode",
-                        "flexible",
-                        "--max-candidates",
-                        "10",
-                        "--top-sectors",
-                        "3",
-                        "--fragments-per-sector",
-                        "2",
-                        "--max-clash-score",
-                        "1000",
-                        "--max-field-score",
-                        "10000",
-                    ]
-                ),
-                0,
-            )
-
-            candidates = json.loads((grow_dir / "candidates.json").read_text())
-            self.assertGreater(candidates["candidate_count"], 0)
-            self.assertNotIn("embedding_failed", candidates["rejections"])
 
     def test_grow_pose_refine_completes_when_rdkit_available(self) -> None:
         try:

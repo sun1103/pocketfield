@@ -165,8 +165,9 @@ def grow(args: argparse.Namespace) -> None:
         conformers=args.conformers,
         pose_refine=args.pose_refine,
         pose_refine_iters=args.pose_refine_iters,
-        linker_fit_mode=args.linker_fit_mode,
+        linker_fit_rmsd_tolerance=args.linker_fit_rmsd_tolerance,
         diversity_threshold=args.diversity_threshold,
+        drop_2d=args.drop_2d,
     )
     out_dir = Path(args.out_dir)
     print(f"Wrote {out_dir / 'candidates.sdf'}")
@@ -229,8 +230,9 @@ def design(args: argparse.Namespace) -> None:
             conformers=args.conformers,
             pose_refine=args.pose_refine,
             pose_refine_iters=args.pose_refine_iters,
-            linker_fit_mode=args.linker_fit_mode,
+            linker_fit_rmsd_tolerance=args.linker_fit_rmsd_tolerance,
             diversity_threshold=args.diversity_threshold,
+            drop_2d=args.drop_2d,
         )
     )
 
@@ -744,6 +746,14 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         "1.0 = off (default); ~0.5 collapses simple chain-length analogs.",
     )
     parser.add_argument(
+        "--drop-2d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop the 2D vector-match prefilter: grow every fragment (single "
+        "mode) or every span-fitting linker (bridge mode) and rank purely by 3D "
+        "score. Use --no-drop-2d to restore 2D match-based selection.",
+    )
+    parser.add_argument(
         "--max-clash-score",
         type=float,
         default=0.5,
@@ -785,14 +795,14 @@ def _add_grow_arguments(parser: argparse.ArgumentParser, include_inputs: bool = 
         help="Nelder-Mead iterations for --pose-refine.",
     )
     parser.add_argument(
-        "--linker-fit-mode",
-        choices=("rigid", "flexible"),
-        default="rigid",
-        help="Bridge-mode linker fitting. 'rigid' (default) pins both anchor "
-        "components and both linker attachment atoms to their docked "
-        "coordinates; 'flexible' pins only the first anchor component and lets "
-        "the second component plus linker close the gap, avoiding spurious "
-        "rejections when a linker's length does not exactly match the gap.",
+        "--linker-fit-rmsd-tolerance",
+        type=float,
+        default=3.0,
+        help="Maximum RMSD (Angstrom) between linker attachment atoms and their "
+        "anchor dummy targets before a bridge candidate is rejected. The anchor "
+        "is held at its docked pose while the linker's torsions relax via a "
+        "constrained UFF minimization; a value above this tolerance means the "
+        "linker could not close the gap.",
     )
     parser.add_argument(
         "--cross-attention-weight",

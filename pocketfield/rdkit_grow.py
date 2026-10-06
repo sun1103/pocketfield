@@ -105,8 +105,9 @@ def grow_candidates(
     conformers: int = 10,
     pose_refine: bool = False,
     pose_refine_iters: int = 60,
-    linker_fit_mode: str = "rigid",
+    linker_fit_rmsd_tolerance: float = 3.0,
     diversity_threshold: float = 1.0,
+    drop_2d: bool = True,
 ) -> dict[str, Any]:
     try:
         from rdkit import Chem, Geometry
@@ -299,6 +300,7 @@ def grow_candidates(
         Chem=Chem,
         anchor_maps=anchor_maps,
         sector_stats=sector_stats,
+        drop_2d=drop_2d,
     )
     candidates = []
     attempted = 0
@@ -398,7 +400,7 @@ def grow_candidates(
             mol3d = Chem.AddHs(mol)
             if anchor_pose is not None:
                 coordMap, coordTranslation = _anchor_coord_map(
-                    Chem, mol3d, anchor_smiles, anchor_structure, linker_fit_mode=linker_fit_mode,
+                    Chem, mol3d, anchor_smiles, anchor_structure,
                 )
             else:
                 coordMap = {}
@@ -416,9 +418,21 @@ def grow_candidates(
             # Optimize each conformer, then translate from origin-centred back
             # to the SDF coordinate frame.
             cx, cy, cz = coordTranslation
+            freeze_anchor = len(coordMap) >= 2
+            anchor_frozen_indices = [
+                atom.GetIdx()
+                for atom in mol3d.GetAtoms()
+                if atom.HasProp("pocketfield_anchor") and atom.GetAtomicNum() > 1
+            ] if freeze_anchor else []
             for conf_id in list(conf_ids):
                 try:
-                    AllChem.UFFOptimizeMolecule(mol3d, confId=conf_id, maxIters=200)
+                    if freeze_anchor:
+                        ff = AllChem.UFFGetMoleculeForceField(mol3d, confId=conf_id)
+                        for idx in anchor_frozen_indices:
+                            ff.AddFixedPoint(idx)
+                        ff.Minimize(maxIts=200)
+                    else:
+                        AllChem.UFFOptimizeMolecule(mol3d, confId=conf_id, maxIters=200)
                 except Exception:
                     pass
                 if len(coordMap) >= 2 and coordTranslation != (0.0, 0.0, 0.0):
@@ -494,6 +508,13 @@ def grow_candidates(
                 _record_rejection(rejections, "field_filter")
                 continue
             linker_fit_rmsd = _linker_fit_rmsd(mol3d, anchor_pose, conf_id=best_conf_id)
+            if (
+                linker_fit_rmsd is not None
+                and linker_fit_rmsd_tolerance is not None
+                and linker_fit_rmsd > linker_fit_rmsd_tolerance
+            ):
+                _record_rejection(rejections, "poor_linker_closure")
+                continue
             _keep_single_conformer(Chem, mol3d, best_conf_id)
             sector_match_score = float(
                 np.mean([attachment["sector_fragment_score"] for attachment in request["attachments"]])

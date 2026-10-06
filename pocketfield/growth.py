@@ -54,6 +54,21 @@ def _fragment_sector_cover(
     return result
 
 
+def _enumerate_fragments(
+    fragment_rankings: dict[int, list[dict[str, Any]]],
+) -> list[Any]:
+    """Unique fragments across all sector rankings, in stable (name) order.
+
+    Used by the drop-2d path to grow every fragment instead of the top-N by
+    vector-match, letting the 3D score do the ranking.
+    """
+    seen: dict[str, Any] = {}
+    for ranked in fragment_rankings.values():
+        for item in ranked:
+            seen.setdefault(item["fragment_name"], item["fragment"])
+    return [seen[name] for name in sorted(seen)]
+
+
 def _resolve_sector_competition(
     covers: list[dict[str, Any]],
 ) -> list[dict[str, Any]] | None:
@@ -118,6 +133,7 @@ def _growth_requests(
     Chem: Any,
     anchor_maps: list[int],
     sector_stats: dict[int, dict[str, float]],
+    drop_2d: bool = True,
 ) -> list[dict[str, Any]]:
     del plan
     del top_sectors
@@ -139,7 +155,34 @@ def _growth_requests(
             linker_distance_tolerance=linker_distance_tolerance,
             linker_conformers=linker_conformers,
             Chem=Chem,
+            drop_2d=drop_2d,
         )
+
+    # Drop-2d: grow every fragment on each dummy as a single substitution and
+    # let the 3D score rank. Pair/multi growth is skipped — enumerating all
+    # fragment combinations there is intractable without a prefilter.
+    if drop_2d:
+        for anchor_map, sectors in dummy_options:
+            direction = _mean_direction([s["direction"] for s in sectors])
+            for fragment in _enumerate_fragments(fragment_rankings):
+                requests.append(
+                    {
+                        "mode": "single",
+                        "sector_ids": [s["sector_id"] for s in sectors],
+                        "dummy_sector_angles": [s["angle_deg"] for s in sectors],
+                        "direction": direction,
+                        "attachments": [
+                            {
+                                "map": anchor_map,
+                                "fragment": fragment,
+                                "sector_fragment_score": 0.0,
+                            }
+                        ],
+                    }
+                )
+                if len(requests) >= request_limit:
+                    return requests
+        return requests
 
     for anchor_map, sectors in dummy_options:
         covers = _fragment_sector_cover(
@@ -294,10 +337,15 @@ def _bridge_requests(
     linker_distance_tolerance: float,
     linker_conformers: int,
     Chem: Any,
+    drop_2d: bool = True,
 ) -> list[dict[str, Any]]:
     requests: list[dict[str, Any]] = []
     for dummy_pair in itertools.combinations(dummy_options, 2):
         (map_a, sectors_a), (map_b, sectors_b) = dummy_pair
+        # A given linker is re-ranked for every (sector_a, sector_b) pair, so the
+        # same top linkers would otherwise be requested many times. Dedupe by
+        # linker so each unique linker is embedded/scored once per dummy pair.
+        seen_linkers: set[str] = set()
         # Union of sectors from both dummies — one linker spans the full pocket
         union_sectors = sectors_a + sectors_b
         union_sector_ids = [s["sector_id"] for s in union_sectors]
@@ -316,10 +364,18 @@ def _bridge_requests(
                     linker_distance_tolerance=linker_distance_tolerance,
                     linker_conformers=linker_conformers,
                     Chem=Chem,
+                    drop_2d=drop_2d,
                 )
                 for linker in ranked_linkers:
-                    score_a = _dummy_adjusted_score(linker["score"], sector_a)
-                    score_b = _dummy_adjusted_score(linker["score"], sector_b)
+                    if linker["linker_name"] in seen_linkers:
+                        continue
+                    seen_linkers.add(linker["linker_name"])
+                    if drop_2d:
+                        score_a = linker["score"]
+                        score_b = linker["score"]
+                    else:
+                        score_a = _dummy_adjusted_score(linker["score"], sector_a)
+                        score_b = _dummy_adjusted_score(linker["score"], sector_b)
                     requests.append(
                         {
                             "mode": "bridge",
@@ -361,6 +417,7 @@ def _rank_bridge_linkers(
     linker_distance_tolerance: float,
     linker_conformers: int,
     Chem: Any,
+    drop_2d: bool = True,
 ) -> list[dict[str, Any]]:
     by_name: dict[str, dict[str, Any]] = {}
     for ranked in linker_rankings.get(int(sector_a["sector_id"]), []):
@@ -385,18 +442,23 @@ def _rank_bridge_linkers(
         )
         if geometry is None:
             continue
-        score = 0.5 * (existing["score_a"] + ranked["score"])
+        if drop_2d:
+            score = geometry["penalty"]
+        else:
+            score = 0.5 * (existing["score_a"] + ranked["score"]) + geometry["penalty"]
         ranked_linkers.append(
             {
                 "linker": ranked["linker"],
                 "linker_name": ranked["linker_name"],
-                "score": float(score + geometry["penalty"]),
+                "score": float(score),
                 "linker_span": geometry["span"],
                 "target_span": geometry["target"],
                 "span_error": geometry["error"],
             }
         )
     ranked_linkers.sort(key=lambda item: item["score"])
+    if drop_2d:
+        return ranked_linkers
     return ranked_linkers[: max(1, limit)]
 
 
@@ -420,19 +482,29 @@ def _linker_geometry_score(
 ) -> dict[str, float] | None:
     if anchor_pose is None:
         return {"target": 0.0, "span": 0.0, "error": 0.0, "penalty": 0.0}
-    dummy_coords = anchor_pose.get("dummy_coords", {})
-    if map_a not in dummy_coords or map_b not in dummy_coords:
-        return {"target": 0.0, "span": 0.0, "error": 0.0, "penalty": 0.0}
-    target = float(np.linalg.norm(dummy_coords[map_a] - dummy_coords[map_b]))
+    # The linker's attachment atoms bond to the anchor's connection atoms, so
+    # the relevant gap is the connection-to-connection distance, not the dummy
+    # exit-vector tips (which point in/out and bias the distance by ~a bond).
+    neighbor_coords = anchor_pose.get("dummy_neighbor_coords", {})
+    if map_a in neighbor_coords and map_b in neighbor_coords:
+        target = float(np.linalg.norm(neighbor_coords[map_a] - neighbor_coords[map_b]))
+    else:
+        dummy_coords = anchor_pose.get("dummy_coords", {})
+        if map_a not in dummy_coords or map_b not in dummy_coords:
+            return {"target": 0.0, "span": 0.0, "error": 0.0, "penalty": 0.0}
+        target = float(np.linalg.norm(dummy_coords[map_a] - dummy_coords[map_b]))
     spans = _sample_linker_spans(Chem, linker, conformers)
     if not spans:
         return None
-    # Only reject linkers that are too short to span the gap.
-    # Longer linkers can adopt a more compact conformation in the pocket;
-    # the 3D embedding and clash/field scoring will determine fitness.
+    # Reject linkers too short to span the gap, and also linkers whose most
+    # compact sampled conformation is still longer than the gap (these cannot
+    # close the anchor in rigid mode and would fail the constrained embedding).
     best_span = max(spans)
+    min_span = min(spans)
     shortfall = max(0.0, target - best_span)
     if shortfall > tolerance:
+        return None
+    if min_span > target + tolerance:
         return None
     return {
         "target": target,

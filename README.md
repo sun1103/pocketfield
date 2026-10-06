@@ -170,10 +170,12 @@ Reports OBC-GBSA and (optionally) explicit TIP3P solvation energies for each mol
 --max-clash-score 0.5
 --max-field-score 0.5
 --sector-match-weight 0.25
+--drop-2d            # default: grow every fragment (single mode) / every span-fitting linker (bridge), rank by 3D score
+--no-drop-2d         # restore 2D vector-match prefilter selection
 --cross-attention-weight 0.25
 --linker-distance-tolerance 2.0
 --linker-conformers 20
---linker-fit-mode rigid
+--linker-fit-rmsd-tolerance 3.0
 --conformers 10
 --pose-refine
 --pose-refine-iters 60
@@ -295,7 +297,7 @@ pocketfield design \
 
 In bridge mode PocketField uses true two-dummy linkers, bonds anchor site `[*:1]` to the linker `[*:1]` neighbor and `[*:2]` to the linker `[*:2]` neighbor, then removes all dummy atoms. Candidate records use `mode: bridge` and produce connected SMILES.
 
-When `--anchor-structure` is supplied, the two anchor components are held at their docked coordinates while the linker is fit between them. `--linker-fit-mode rigid` (default) pins both components and both linker attachment atoms, so a linker whose length does not exactly match the anchor gap is rejected at embedding. `--linker-fit-mode flexible` pins only the first anchor component and lets the second component plus the linker close the gap — this recovers linkers the rigid fit would reject, at the cost of moving one anchor component off its docked pose (recorded in the candidate's `linker_fit_rmsd`).
+When `--anchor-structure` is supplied, the two anchor components are held at their docked coordinates while the linker is fit between them. The anchor atoms are kept fixed during a constrained UFF minimization, so the linker's torsions relax to close the gap rather than the anchor moving off its docked pose. A candidate whose linker attachment atoms land farther than `--linker-fit-rmsd-tolerance` (default 3.0 Å) from their anchor dummy targets is rejected as `poor_linker_closure`; the residual is recorded in each candidate's `linker_fit_rmsd`.
 
 ### Vector matching
 
@@ -442,6 +444,10 @@ Scores are normalised to `[0, 1]`, so to disable the field/clash filters set the
 ### Diversity selection
 
 `--diversity-threshold` (default `1.0` = off) is a pre-step diversity filter in the spirit of STELLA's clustering-based selection: instead of spending 3D embedding on every enumerated candidate, PocketField computes an ECFP4 (radius 2) fingerprint on each *grown fragment/linker* (the variable substituent), not the whole molecule — the anchor is constant across candidates and would otherwise swamp the similarity signal. A candidate is dropped when its substituent *pattern* is similar to an already-kept candidate's at **every anchor map** (per-map Tanimoto > threshold); the same fragment on a different dummy stays distinct. This runs *before* `AddHs`/`EmbedMultipleConfs`/UFF, so the expensive 3D + scoring work is only paid for structurally diverse representatives. Requests are first sorted by their cheap sector-match score, so within each cluster the most promising member is the one that gets embedded. The cutoff is a max-Tanimoto on the substituent fingerprint — lower collapses more aggressively (e.g. `[*:1]CC` vs `[*:1]CCC` ≈ 0.56, while `[*:1]C` vs `[*:1]O` ≈ 0.2). A value around `0.5` collapses simple chain-length analogs but keeps distinct functional groups; `1.0` disables the filter. Tune it against the fragment library you want to treat as interchangeable.
+
+### 2D vector-match prefilter (dropped)
+
+`--drop-2d` (default on; `--no-drop-2d` restores the old path) removes the 15-dim vector-match score from candidate *selection*. The match was never part of the final ranking (`score = 0.35·field + 0.30·clash + 0.15·n_heavy/70`); it only pre-filtered which fragments/linkers got embedded. In both growth modes that prefilter was anti-predictive of the 3D field fit, so with it dropped `grow` enumerates every fragment (single mode) or every span-fitting linker (bridge mode — the geometric span check is feasibility, not chemistry, and is kept) and lets the 3D score rank the whole library. Pair/multi growth is skipped under `--drop-2d`, since enumerating all fragment combinations is intractable without a prefilter.
 
 ---
 
